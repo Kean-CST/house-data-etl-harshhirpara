@@ -43,17 +43,84 @@ PG_COLUMN_SCHEMA = (
 
 def extract(spark: SparkSession, csv_path: str) -> DataFrame:
     """Load the CSV dataset into a PySpark DataFrame with correct data types."""
-    raise NotImplementedError
+    return spark.read.csv(csv_path, header=True, inferSchema=False)
 
 
 def transform(df: DataFrame) -> dict[str, DataFrame]:
     """Split the data by neighborhood and save each as a separate CSV file."""
-    raise NotImplementedError
+    import shutil
+    import glob
+
+    # Boolean columns to normalise: raw CSV has TRUE/FALSE, expected output is True/False
+    bool_cols = ["has_pool", "recently_renovated", "has_children", "first_time_buyer"]
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    partitions: dict[str, DataFrame] = {}
+    for hood in NEIGHBORHOODS:
+        hood_df = (
+            df.filter(F.col("neighborhood") == hood)
+            .orderBy("house_id")
+        )
+        partitions[hood] = hood_df  # keep raw strings for the load step
+
+        # Build a normalised version for CSV output:
+        # - booleans: TRUE/FALSE → True/False (title-case)
+        # - sale_date: M/D/YY → YYYY-MM-DD (ISO 8601)
+        csv_df = hood_df
+        for col in bool_cols:
+            csv_df = csv_df.withColumn(
+                col,
+                F.when(F.upper(F.col(col)) == "TRUE", "True")
+                 .when(F.upper(F.col(col)) == "FALSE", "False")
+                 .otherwise(F.col(col))
+            )
+        csv_df = csv_df.withColumn(
+            "sale_date",
+            F.date_format(F.to_date(F.col("sale_date"), "M/d/yy"), "yyyy-MM-dd")
+        )
+
+        # Write via Spark's native CSV writer (single partition) then rename
+        # the part-*.csv to the desired filename.
+        tmp_dir = str(OUTPUT_DIR / f"_tmp_{hood.replace(' ', '_').lower()}")
+        csv_df.coalesce(1).write.csv(tmp_dir, header=True, mode="overwrite")
+        part_files = glob.glob(f"{tmp_dir}/part-*.csv")
+        import os as _os
+        _os.replace(part_files[0], str(OUTPUT_FILES[hood]))
+        shutil.rmtree(tmp_dir)
+
+    return partitions
 
 
 def load(partitions: dict[str, DataFrame], jdbc_url: str, pg_props: dict) -> None:
     """Insert each neighborhood dataset into its own PostgreSQL table."""
-    raise NotImplementedError
+    # Cast string columns to proper types before writing to PostgreSQL
+    cast_exprs = [
+        F.col("house_id"),
+        F.col("neighborhood"),
+        F.col("price").cast("int"),
+        F.col("square_feet").cast("int"),
+        F.col("num_bedrooms").cast("int"),
+        F.col("num_bathrooms").cast("int"),
+        F.col("house_age").cast("int"),
+        F.col("garage_spaces").cast("int"),
+        F.col("lot_size_acres").cast("decimal(6,2)"),
+        F.col("has_pool").cast("boolean"),
+        F.col("recently_renovated").cast("boolean"),
+        F.col("energy_rating"),
+        F.col("location_score").cast("int"),
+        F.col("school_rating").cast("int"),
+        F.col("crime_rate").cast("int"),
+        F.col("distance_downtown_miles").cast("decimal(6,2)"),
+        F.to_date(F.col("sale_date"), "M/d/yy").alias("sale_date"),
+        F.col("days_on_market").cast("int"),
+    ]
+    for hood, hood_df in partitions.items():
+        table = PG_TABLES[hood]
+        (
+            hood_df.select(cast_exprs)
+            .write.jdbc(url=jdbc_url, table=table, mode="overwrite", properties=pg_props)
+        )
 
 
 # ── Main (do not modify) ───────────────────────────────────────────────────────

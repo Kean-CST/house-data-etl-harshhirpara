@@ -3,4 +3,5 @@ __pycache__/
 *.py[cod]
 .DS_Store
 output/
+.venv/
 src/etl_pipeline_solution.py
